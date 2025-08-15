@@ -1,0 +1,38 @@
+[
+  {
+    "site": "Template",
+    "person": "John",
+    "months": ["March", "August", "November", "January"],
+    "excel": "Ghost Town.xlsx"
+  },
+  {
+    "site": "Wolf Steel",
+    "person": "Natasha",
+    "months": ["March", "June", "October"],
+    "excel":"Wolf Steel.xlsx"
+  },
+    {
+    "site": "Aberfoyle GO",
+    "person": "Tyler",
+    "months": ["March", "June", "October"],
+    "excel":"Aberfoyle GO Station.xlsx"
+  },
+    {
+    "site": "Erin",
+    "person": "Natasha",
+    "months": ["March","May", "June", "October"],
+    "excel":"Erin.xlsx"
+  },
+    {
+    "site": "Bench Brewery",
+    "person": "Natasha",
+    "months": ["March", "June", "October"],
+    "excel":"Bench Brewery.xlsx"
+  },
+    {
+    "site": "Michaelle Jean",
+    "person": "Natasha",
+    "months": ["March", "June", "October"],
+    "excel":"Michaelle Jean.xlsx"
+  }
+]
