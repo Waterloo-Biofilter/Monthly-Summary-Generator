@@ -1,4 +1,4 @@
-# SGSData.py — TABLE then two GRAPHS (fixed-size charts for mobile visibility)
+# SGSData.py — one TABLE + two GRAPHS per sheet (last 6 months)
 # Usage: SGSData.py <excel.xlsx> <months_csv> <year> [output.docx]
 
 import sys, re
@@ -10,7 +10,7 @@ import openpyxl
 from openpyxl.utils.datetime import from_excel as oxl_from_excel, CALENDAR_WINDOWS_1900
 
 from docx import Document
-from docx.shared import Cm, Pt, Inches
+from docx.shared import Pt, Inches
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
@@ -21,7 +21,7 @@ BASE_DIR    = Path(__file__).parent.resolve()
 PRODUCT_DIR = BASE_DIR / "Product"; PRODUCT_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------- fixed chart display size (inches) --------
-GRAPH_WIDTH_IN = 6.5   # <- increase to 6.7 or 7.0 if you want even bigger on mobile
+GRAPH_WIDTH_IN = 6.7   # phone-friendly fixed width
 
 # -------- parsing config --------
 DATE_PARSE_FORMATS = ("%d-%b-%Y","%d-%b-%y","%Y-%m-%d","%b %d, %Y","%B %d, %Y","%d/%m/%Y","%m/%d/%Y")
@@ -34,6 +34,19 @@ def find_latest_docx(product_dir: Path) -> Path:
     docs = [p for p in product_dir.glob("*.docx") if not p.name.startswith("~$")]
     if not docs: raise FileNotFoundError(f"No .docx files found in {product_dir}")
     return max(docs, key=lambda p: p.stat().st_mtime)
+
+def ym_add(year: int, month: int, delta: int) -> tuple[int,int]:
+    """Add delta months to (year, month)."""
+    y = year + (month - 1 + delta) // 12
+    m = (month - 1 + delta) % 12 + 1
+    return y, m
+
+def month_start(year: int, month: int) -> datetime:
+    return datetime(year, month, 1)
+
+def month_end(year: int, month: int) -> datetime:
+    ny, nm = ym_add(year, month, 1)
+    return datetime(ny, nm, 1) - timedelta(days=1)
 
 def parse_date_cell(val) -> datetime | None:
     if isinstance(val, datetime): return val
@@ -90,9 +103,11 @@ def find_param_header_row(ws) -> int | None:
 
 def find_date_column(ws) -> int | None:
     max_r = min(ws.max_row, 60); max_c = min(ws.max_column, 60)
+    # Prefer a header named "Date"
     for r in range(1, max_r+1):
         for c in range(1, max_c+1):
             if "date" in text(ws, r, c).lower(): return c
+    # Fallback: best column by "looks like a date" density
     best_col, best_score = None, -1; N = min(ws.max_row, 40)
     for c in range(1, max_c+1):
         score = sum(1 for r in range(1, N+1) if parse_date_cell(ws.cell(row=r, column=c).value))
@@ -109,7 +124,6 @@ def plot_series_to_doc(doc: Document, title: str, series: dict[str, list[tuple[d
         if pts: clean[k] = pts
     if not clean: return
 
-    # Big figure + thick lines for readability
     plt.figure(figsize=(11, 6), dpi=300)
     any_pts = False
     for label, pts in clean.items():
@@ -131,12 +145,11 @@ def plot_series_to_doc(doc: Document, title: str, series: dict[str, list[tuple[d
 
     img = BytesIO(); plt.savefig(img, format="png", dpi=300); plt.close(); img.seek(0)
     doc.add_paragraph()
-    # FIXED absolute size on page (prevents mobile auto-shrink)
     doc.add_picture(img, width=Inches(GRAPH_WIDTH_IN))
     img.close()
 
-# -------- per-sheet workflow --------
-def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, year: int) -> bool:
+# -------- per-sheet workflow (one table + two graphs over last 6 months) --------
+def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, year: int, need_pagebreak: bool) -> bool:
     param_row = find_param_header_row(ws); date_col = find_date_column(ws)
     if not param_row or not date_col: return False
 
@@ -146,18 +159,30 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
         row_text = " ".join(text(ws, start_row, c).lower() for c in range(1, ws.max_column+1))
         if any(k in row_text for k in ("units","cofa","eca","objective","limit")): start_row += 1
 
-    # Collect dates + row indices
+    # Collect all dates + row indices
     dates, row_idxs = [], []
     for r in range(start_row, ws.max_row+1):
         dt = parse_date_cell(ws.cell(row=r, column=date_col).value)
         if dt: dates.append(dt); row_idxs.append(r)
     if not dates: return False
 
-    # Window from AutoSummary (now last 6 months)
-    allowed_months = {int(x) for x in months_csv.split(",") if x.strip()}
-    idxs = [i for i,d in enumerate(dates) if d.year == year and d.month in allowed_months] or list(range(len(dates)))
+    # --- TRUE last-6-months window (cross-year safe) ---
+    tokens = [int(x) for x in months_csv.split(",") if x.strip().isdigit()]
+    if tokens:
+        sel_month = tokens[-1]     # GUI's selected month is last in months_csv (AutoSummary behavior)
+        sel_year  = year
+    else:
+        latest = max(dates)
+        sel_month, sel_year = latest.month, latest.year
 
-    # Select parameter columns & groups
+    start_y, start_m = ym_add(sel_year, sel_month, -5)
+    start_dt = month_start(start_y, start_m)
+    end_dt   = month_end(sel_year, sel_month)
+
+    idxs = [i for i, d in enumerate(dates) if start_dt <= d <= end_dt]
+    if not idxs: return False
+
+    # Select parameter columns & groups (only those with any numeric data in the 6-month window)
     group1_cols, group1_labels, group2_cols, group2_labels = [], [], [], []
     all_cols, all_labels = [], []
     for c in range(1, ws.max_column+1):
@@ -179,8 +204,17 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
         if in_g2: group2_cols.append(c); group2_labels.append(raw.strip())
     if not all_cols: return False
 
-    # TABLE (Date + all selected params)
-    headers = ["Date"] + all_labels; rows = []
+    # PAGE BREAK per sheet (not per month)
+    if need_pagebreak:
+        doc.add_page_break()
+
+    # Heading uses trimmed sheet name (drop common 3-letter site code prefix if present)
+    trimmed = sheet_name.split(" ", 1)[1] if " " in sheet_name else sheet_name
+    doc.add_heading(trimmed, level=2)
+
+    # TABLE over the full 6-month window
+    headers = ["Date"] + all_labels
+    rows = []
     for i in idxs:
         r = row_idxs[i]; dt = dates[i]
         row = [dt.strftime("%d-%b-%y")]
@@ -190,12 +224,10 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
             except Exception: row.append("" if v is None else str(v))
         rows.append(row)
 
-    trimmed = sheet_name.split(" ", 1)[1] if " " in sheet_name else sheet_name
-    doc.add_heading(trimmed, level=2)
     add_word_table(doc, headers, rows)
     doc.add_paragraph()
 
-    # GRAPH 1: cBOD/BOD/TSS
+    # GRAPH 1: cBOD/BOD/TSS — last 6 months (all points in window)
     if group1_cols:
         series1 = {}
         for label, c in zip(group1_labels, group1_cols):
@@ -205,9 +237,9 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
                 try: pts.append((dates[i], float(v)))
                 except Exception: continue
             if pts: series1[label] = pts
-        if series1: plot_series_to_doc(doc, f"{trimmed} — cBOD/BOD/TSS", series1)
+        if series1: plot_series_to_doc(doc, f"{trimmed} — cBOD/BOD/TSS (Last 6 Months)", series1)
 
-    # GRAPH 2: Nitrogen species
+    # GRAPH 2: Nitrogen species — last 6 months
     if group2_cols:
         series2 = {}
         for label, c in zip(group2_labels, group2_cols):
@@ -217,7 +249,7 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
                 try: pts.append((dates[i], float(v)))
                 except Exception: continue
             if pts: series2[label] = pts
-        if series2: plot_series_to_doc(doc, f"{trimmed} — Nitrogen Species", series2)
+        if series2: plot_series_to_doc(doc, f"{trimmed} — Nitrogen Species (Last 6 Months)", series2)
 
     return True
 
@@ -231,16 +263,29 @@ def main():
     doc_path = out_docx if out_docx else find_latest_docx(PRODUCT_DIR)
     doc = Document(doc_path)
 
-    doc.add_page_break(); doc.add_heading("Appendix A: SGS Tables & Graphs", level=1)
+    # Remove top margin across sections
+    for section in doc.sections:
+        section.top_margin = Pt(0)
+
+    # Keep your appendix header
+    doc.add_page_break()
+    doc.add_heading("Appendix A: SGS Tables & Graphs", level=1)
 
     any_done = False
+    first_section = True
     for sheet_name in wb.sheetnames:
         lname = sheet_name.lower()
         process = (any(k in lname for k in ["raw","sewage","biofilter","waternox","waternox-ls"])
                    or ("final effluent" in lname or "polisher effluent" in lname))
         if not process: continue
-        if table_then_two_graphs(doc, wb[sheet_name], sheet_name, months_csv, year): any_done = True
-        if "final effluent" in lname or "polisher effluent" in lname: break
+
+        if table_then_two_graphs(doc, wb[sheet_name], sheet_name, months_csv, year, need_pagebreak=not first_section):
+            any_done = True
+            first_section = False
+
+        # Stop after final/polisher (matches original flow)
+        if "final effluent" in lname or "polisher effluent" in lname:
+            break
 
     doc.save(doc_path)
     print(f"{'Appended' if any_done else 'No'} SGS tables & graphs {'into' if any_done else ''} {doc_path.name if any_done else ''}".strip())
