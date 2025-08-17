@@ -10,18 +10,27 @@ import openpyxl
 from openpyxl.utils.datetime import from_excel as oxl_from_excel, CALENDAR_WINDOWS_1900
 
 from docx import Document
-from docx.shared import Pt, Inches
+from docx.shared import Pt, Inches, Cm
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.enum.table import WD_ROW_HEIGHT_RULE
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+# -------- appearance tweaks you can tune --------
+GRAPH_WIDTH_IN = 6.7        # fixed graph width for readability on mobile
+HEADER_FILL_HEX = "6CA9EF"  # light blue header row
+# Auto-fit row heights: keep these as None (no explicit height set)
+HEADER_ROW_HEIGHT_CM = None
+BODY_ROW_HEIGHT_CM   = None
+# Table padding (in DXA; 1 pt = 20 dxa). Smaller = tighter.
+TABLE_CELL_PADDING_DXA = 60
+# ONLY widen the Date column
+DATE_COL_WIDTH_IN    = 1.6
+
 BASE_DIR    = Path(__file__).parent.resolve()
 PRODUCT_DIR = BASE_DIR / "Product"; PRODUCT_DIR.mkdir(parents=True, exist_ok=True)
-
-# -------- fixed chart display size (inches) --------
-GRAPH_WIDTH_IN = 6.7   # phone-friendly fixed width
 
 # -------- parsing config --------
 DATE_PARSE_FORMATS = ("%d-%b-%Y","%d-%b-%y","%Y-%m-%d","%b %d, %Y","%B %d, %Y","%d/%m/%Y","%m/%d/%Y")
@@ -30,11 +39,7 @@ GROUP1_KEYS = {"cbod5","bod5","tss","cbod","bod"}   # Graph 1
 GROUP2_KEYS = {"tkn","tan","no2","no3","tn"}        # Graph 2
 EXCLUDE_HDR_WORDS = {"units","objective","limit","average","median","cofa","eca"}
 
-def find_latest_docx(product_dir: Path) -> Path:
-    docs = [p for p in product_dir.glob("*.docx") if not p.name.startswith("~$")]
-    if not docs: raise FileNotFoundError(f"No .docx files found in {product_dir}")
-    return max(docs, key=lambda p: p.stat().st_mtime)
-
+# ---------- helpers for last-6-months window ----------
 def ym_add(year: int, month: int, delta: int) -> tuple[int,int]:
     """Add delta months to (year, month)."""
     y = year + (month - 1 + delta) // 12
@@ -48,6 +53,11 @@ def month_end(year: int, month: int) -> datetime:
     ny, nm = ym_add(year, month, 1)
     return datetime(ny, nm, 1) - timedelta(days=1)
 
+def find_latest_docx(product_dir: Path) -> Path:
+    docs = [p for p in product_dir.glob("*.docx") if not p.name.startswith("~$")]
+    if not docs: raise FileNotFoundError(f"No .docx files found in {product_dir}")
+    return max(docs, key=lambda p: p.stat().st_mtime)
+
 def parse_date_cell(val) -> datetime | None:
     if isinstance(val, datetime): return val
     if val is None or (isinstance(val, str) and not val.strip()): return None
@@ -60,10 +70,13 @@ def parse_date_cell(val) -> datetime | None:
             except Exception: continue
         return None
     if isinstance(val, (int, float)):
-        try: converted = oxl_from_excel(val, CALENDAR_WINDOWS_1900)
+        try:
+            converted = oxl_from_excel(val, CALENDAR_WINDOWS_1900)
         except Exception:
-            try: converted = datetime(1899,12,30) + timedelta(days=float(val))
-            except Exception: return None
+            try:
+                converted = datetime(1899,12,30) + timedelta(days=float(val))
+            except Exception:
+                return None
         if isinstance(converted, dtime): return None
         if isinstance(converted, ddate) and not isinstance(converted, datetime):
             return datetime(converted.year, converted.month, converted.day)
@@ -76,16 +89,91 @@ def text(ws, r, c) -> str:
     v = ws.cell(row=r, column=c).value
     return ("" if v is None else str(v)).strip()
 
+def shade_cell(cell, fill_hex: str):
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = tcPr.find(qn('w:shd'))
+    if shd is None:
+        shd = OxmlElement('w:shd')
+        tcPr.append(shd)
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill_hex)  # hex WITHOUT leading '#'
+
+def _set_table_cell_margins(table, top=None, start=None, bottom=None, end=None):
+    """Apply table-level cell padding (margins) in DXA units."""
+    tblPr = table._tblPr
+    mar = tblPr.find(qn('w:tblCellMar'))
+    if mar is None:
+        mar = OxmlElement('w:tblCellMar')
+        tblPr.append(mar)
+    for side, val in (('top', top), ('start', start), ('bottom', bottom), ('end', end)):
+        if val is None:
+            continue
+        el = mar.find(qn(f'w:{side}'))
+        if el is None:
+            el = OxmlElement(f'w:{side}')
+            mar.append(el)
+        el.set(qn('w:w'), str(val))
+        el.set(qn('w:type'), 'dxa')
+
 def add_word_table(doc: Document, headers, rows):
-    t = doc.add_table(rows=len(rows)+1, cols=len(headers)); t.style = "Table Grid"
-    for j, h in enumerate(headers): t.cell(0, j).text = h
+    t = doc.add_table(rows=len(rows)+1, cols=len(headers))
+    t.style = "Table Grid"
+    t.autofit = False  # ensure our explicit width sticks
+
+    # Header row
+    for j, h in enumerate(headers):
+        cell = t.cell(0, j)
+        cell.text = h
+        shade_cell(cell, HEADER_FILL_HEX)
+
+    # Body rows
     for i, row in enumerate(rows, start=1):
-        for j, v in enumerate(row): t.cell(i, j).text = "" if v is None else str(v)
-    for row in t.rows:
-        for cell in row.cells:
+        for j, v in enumerate(row):
+            t.cell(i, j).text = "" if v is None else str(v)
+
+    # Tighten paragraph spacing for all cells
+    for row_obj in t.rows:
+        for cell in row_obj.cells:
             for p in cell.paragraphs:
-                pf = p.paragraph_format; pf.space_before = Pt(0); pf.space_after = Pt(0)
-    tblPr = t._tblPr; tblLayout = OxmlElement('w:tblLayout'); tblLayout.set(qn('w:type'), 'fixed'); tblPr.append(tblLayout)
+                pf = p.paragraph_format
+                pf.space_before = Pt(0)
+                pf.space_after  = Pt(0)
+
+    # ---- Row heights (auto-fit when constants are None) ----
+    if HEADER_ROW_HEIGHT_CM is not None:
+        t.rows[0].height = Cm(HEADER_ROW_HEIGHT_CM)
+        t.rows[0].height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+    if BODY_ROW_HEIGHT_CM is not None:
+        for ri in range(1, len(t.rows)):
+            t.rows[ri].height = Cm(BODY_ROW_HEIGHT_CM)
+            t.rows[ri].height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+
+    # --- ONLY widen the column whose header contains "Date" ---
+    date_col_idx = None
+    for j, h in enumerate(headers):
+        if "date" in str(h).strip().lower():
+            date_col_idx = j
+            break
+    if date_col_idx is not None:
+        for cell in t.columns[date_col_idx].cells:
+            cell.width = Inches(DATE_COL_WIDTH_IN)
+
+    # Fixed layout prevents Word from re-autofitting widths
+    tblPr = t._tblPr
+    tblLayout = OxmlElement('w:tblLayout')
+    tblLayout.set(qn('w:type'), 'fixed')
+    tblPr.append(tblLayout)
+
+    # Trim inner cell padding to reduce bulk
+    _set_table_cell_margins(
+        t,
+        top=TABLE_CELL_PADDING_DXA,
+        start=TABLE_CELL_PADDING_DXA,
+        bottom=TABLE_CELL_PADDING_DXA,
+        end=TABLE_CELL_PADDING_DXA
+    )
+
     return t
 
 # -------- find header/Date --------
@@ -97,8 +185,10 @@ def find_param_header_row(ws) -> int | None:
             s = text(ws, r, c).lower()
             if not s: continue
             tok = re.sub(r"[^a-z0-9]+", "", s)
-            if any(key in tok for key in PARAM_KEYS): hits += 1
-        if hits >= 2: return r
+            if any(key in tok for key in PARAM_KEYS):
+                hits += 1
+        if hits >= 2:
+            return r
     return None
 
 def find_date_column(ws) -> int | None:
@@ -106,23 +196,29 @@ def find_date_column(ws) -> int | None:
     # Prefer a header named "Date"
     for r in range(1, max_r+1):
         for c in range(1, max_c+1):
-            if "date" in text(ws, r, c).lower(): return c
+            if "date" in text(ws, r, c).lower():
+                return c
     # Fallback: best column by "looks like a date" density
-    best_col, best_score = None, -1; N = min(ws.max_row, 40)
+    best_col, best_score = None, -1
+    N = min(ws.max_row, 40)
     for c in range(1, max_c+1):
         score = sum(1 for r in range(1, N+1) if parse_date_cell(ws.cell(row=r, column=c).value))
-        if score > best_score: best_score, best_col = score, c
+        if score > best_score:
+            best_score, best_col = score, c
     return best_col
 
 # -------- plotting (absolute, fixed size) --------
 def plot_series_to_doc(doc: Document, title: str, series: dict[str, list[tuple[datetime,float]]]):
-    if not series: return
+    if not series:
+        return
     clean = {}
     for k, pts in series.items():
         pts = [(dt, v) for dt, v in pts if isinstance(dt, datetime)]
         pts.sort(key=lambda x: x[0])
-        if pts: clean[k] = pts
-    if not clean: return
+        if pts:
+            clean[k] = pts
+    if not clean:
+        return
 
     plt.figure(figsize=(11, 6), dpi=300)
     any_pts = False
@@ -131,7 +227,8 @@ def plot_series_to_doc(doc: Document, title: str, series: dict[str, list[tuple[d
         if xs and ys:
             any_pts = True
             plt.plot(xs, ys, marker='o', linewidth=2.6, markersize=6, label=label)
-    if not any_pts: plt.close(); return
+    if not any_pts:
+        plt.close(); return
 
     ax = plt.gca()
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%d-%b-%y'))
@@ -151,25 +248,29 @@ def plot_series_to_doc(doc: Document, title: str, series: dict[str, list[tuple[d
 # -------- per-sheet workflow (one table + two graphs over last 6 months) --------
 def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, year: int, need_pagebreak: bool) -> bool:
     param_row = find_param_header_row(ws); date_col = find_date_column(ws)
-    if not param_row or not date_col: return False
+    if not param_row or not date_col:
+        return False
 
     # Data begins after the param row; skip meta rows like Units/ECA/CofA
     start_row = param_row + 1
     for _ in range(2):
         row_text = " ".join(text(ws, start_row, c).lower() for c in range(1, ws.max_column+1))
-        if any(k in row_text for k in ("units","cofa","eca","objective","limit")): start_row += 1
+        if any(k in row_text for k in ("units","cofa","eca","objective","limit")):
+            start_row += 1
 
     # Collect all dates + row indices
     dates, row_idxs = [], []
     for r in range(start_row, ws.max_row+1):
         dt = parse_date_cell(ws.cell(row=r, column=date_col).value)
-        if dt: dates.append(dt); row_idxs.append(r)
-    if not dates: return False
+        if dt:
+            dates.append(dt); row_idxs.append(r)
+    if not dates:
+        return False
 
     # --- TRUE last-6-months window (cross-year safe) ---
     tokens = [int(x) for x in months_csv.split(",") if x.strip().isdigit()]
     if tokens:
-        sel_month = tokens[-1]     # GUI's selected month is last in months_csv (AutoSummary behavior)
+        sel_month = tokens[-1]     # GUI's selected month is last in months_csv
         sel_year  = year
     else:
         latest = max(dates)
@@ -180,35 +281,42 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
     end_dt   = month_end(sel_year, sel_month)
 
     idxs = [i for i, d in enumerate(dates) if start_dt <= d <= end_dt]
-    if not idxs: return False
+    if not idxs:
+        return False
 
     # Select parameter columns & groups (only those with any numeric data in the 6-month window)
     group1_cols, group1_labels, group2_cols, group2_labels = [], [], [], []
     all_cols, all_labels = [], []
     for c in range(1, ws.max_column+1):
-        if c == date_col: continue
+        if c == date_col:
+            continue
         raw = text(ws, param_row, c)
-        if not raw: continue
+        if not raw:
+            continue
         norm = re.sub(r"[^a-z0-9]+", "", raw.lower())
-        if not norm or norm == "date" or any(w in norm for w in EXCLUDE_HDR_WORDS): continue
+        if not norm or norm == "date" or any(w in norm for w in EXCLUDE_HDR_WORDS):
+            continue
 
         in_g1 = any(k in norm for k in GROUP1_KEYS)
         in_g2 = any(k in norm for k in GROUP2_KEYS)
-        if not (in_g1 or in_g2): continue
+        if not (in_g1 or in_g2):
+            continue
 
         has_num = any(isinstance(ws.cell(row=row_idxs[i], column=c).value, (int,float)) for i in idxs)
-        if not has_num: continue
+        if not has_num:
+            continue
 
         all_cols.append(c); all_labels.append(raw.strip())
         if in_g1: group1_cols.append(c); group1_labels.append(raw.strip())
         if in_g2: group2_cols.append(c); group2_labels.append(raw.strip())
-    if not all_cols: return False
+    if not all_cols:
+        return False
 
     # PAGE BREAK per sheet (not per month)
     if need_pagebreak:
         doc.add_page_break()
 
-    # Heading uses trimmed sheet name (drop common 3-letter site code prefix if present)
+    # Heading uses trimmed sheet name (drop first token if it's a site code)
     trimmed = sheet_name.split(" ", 1)[1] if " " in sheet_name else sheet_name
     doc.add_heading(trimmed, level=2)
 
@@ -220,24 +328,30 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
         row = [dt.strftime("%d-%b-%y")]
         for c in all_cols:
             v = ws.cell(row=r, column=c).value
-            try: row.append(f"{float(v):g}")
-            except Exception: row.append("" if v is None else str(v))
+            try:
+                row.append(f"{float(v):g}")
+            except Exception:
+                row.append("" if v is None else str(v))
         rows.append(row)
 
     add_word_table(doc, headers, rows)
     doc.add_paragraph()
 
-    # GRAPH 1: cBOD/BOD/TSS — last 6 months (all points in window)
+    # GRAPH 1: cBOD/BOD/TSS — last 6 months
     if group1_cols:
         series1 = {}
         for label, c in zip(group1_labels, group1_cols):
             pts = []
             for i in idxs:
                 r = row_idxs[i]; v = ws.cell(row=r, column=c).value
-                try: pts.append((dates[i], float(v)))
-                except Exception: continue
-            if pts: series1[label] = pts
-        if series1: plot_series_to_doc(doc, f"{trimmed} — cBOD/BOD/TSS (Last 6 Months)", series1)
+                try:
+                    pts.append((dates[i], float(v)))
+                except Exception:
+                    continue
+            if pts:
+                series1[label] = pts
+        if series1:
+            plot_series_to_doc(doc, f"{trimmed} — cBOD/BOD/TSS (Last 6 Months)", series1)
 
     # GRAPH 2: Nitrogen species — last 6 months
     if group2_cols:
@@ -246,10 +360,14 @@ def table_then_two_graphs(doc: Document, ws, sheet_name: str, months_csv: str, y
             pts = []
             for i in idxs:
                 r = row_idxs[i]; v = ws.cell(row=r, column=c).value
-                try: pts.append((dates[i], float(v)))
-                except Exception: continue
-            if pts: series2[label] = pts
-        if series2: plot_series_to_doc(doc, f"{trimmed} — Nitrogen Species (Last 6 Months)", series2)
+                try:
+                    pts.append((dates[i], float(v)))
+                except Exception:
+                    continue
+            if pts:
+                series2[label] = pts
+        if series2:
+            plot_series_to_doc(doc, f"{trimmed} — Nitrogen Species (Last 6 Months)", series2)
 
     return True
 
@@ -263,11 +381,11 @@ def main():
     doc_path = out_docx if out_docx else find_latest_docx(PRODUCT_DIR)
     doc = Document(doc_path)
 
-    # Remove top margin across sections
+    # Remove top margin across sections (for tighter fit)
     for section in doc.sections:
         section.top_margin = Pt(0)
 
-    # Keep your appendix header
+    # Appendix heading
     doc.add_page_break()
     doc.add_heading("Appendix A: SGS Tables & Graphs", level=1)
 
@@ -277,7 +395,8 @@ def main():
         lname = sheet_name.lower()
         process = (any(k in lname for k in ["raw","sewage","biofilter","waternox","waternox-ls"])
                    or ("final effluent" in lname or "polisher effluent" in lname))
-        if not process: continue
+        if not process:
+            continue
 
         if table_then_two_graphs(doc, wb[sheet_name], sheet_name, months_csv, year, need_pagebreak=not first_section):
             any_done = True
@@ -290,4 +409,5 @@ def main():
     doc.save(doc_path)
     print(f"{'Appended' if any_done else 'No'} SGS tables & graphs {'into' if any_done else ''} {doc_path.name if any_done else ''}".strip())
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

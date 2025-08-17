@@ -178,7 +178,6 @@ class SummaryGUI(QMainWindow):
             doc.add_heading(site_entry["site"], level=0)
             doc.add_paragraph(f"Assigned to: {person}")
             doc.add_paragraph(f"Reporting Month: {picked_month_name} {year}")
-            doc.add_paragraph("")
             doc.add_heading("Results and Discussion", level=1)
             doc.save(out_path)
 

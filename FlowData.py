@@ -332,9 +332,7 @@ def main():
                         doc.add_paragraph()
                         doc.add_picture(img, width=Cm(16))
                         img.close()
-
-        doc.add_heading("Appendix C: Site Notes", level=1)
-
+                        
     doc.save(doc_path)
     print(f"Appended FlowData results into {doc_path.name}")
 
